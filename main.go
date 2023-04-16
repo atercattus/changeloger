@@ -31,6 +31,7 @@ var (
 	argv struct {
 		GitHubToken string
 		Help        bool
+		MainBranch  string
 	}
 )
 
@@ -40,6 +41,7 @@ const (
 
 func init() {
 	flag.StringVar(&argv.GitHubToken, "github-token", "", "OAuth2 token for GitHub API")
+	flag.StringVar(&argv.MainBranch, "main-branch", "main", "Name of the main branch (main, master, ...)")
 	flag.BoolVar(&argv.Help, "help", false, "Show this help")
 	flag.BoolVar(&argv.Help, "h", false, "Show this help")
 
@@ -163,8 +165,9 @@ func getLastGitTag() (string, error) {
 }
 
 func getGitMerges(lastTag string) ([]MergeInfo, error) {
+	branch := "origin/" + argv.MainBranch
 	var buf bytes.Buffer
-	if err := execGit(&buf, `log`, `--merges`, `--pretty=format:%H --- %an --- %aE --- %s`, lastTag+`..origin/master`); err != nil {
+	if err := execGit(&buf, `log`, `--merges`, `--pretty=format:%H --- %an --- %aE --- %s`, lastTag+`..`+branch); err != nil {
 		return nil, err
 	}
 
@@ -326,7 +329,7 @@ func generate() (string, error) {
 
 	merges, err := getGitMerges(lastTag)
 	if err != nil {
-		return "", fmt.Errorf("can't get merges from last tag: %w", err)
+		return "", fmt.Errorf("can't get merges from last tag %q: %w", lastTag, err)
 	}
 
 	cl, err := generateChangelogSection(merges)
