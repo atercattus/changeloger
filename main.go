@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,8 +13,6 @@ import (
 	"net/url"
 	"os/exec"
 	"regexp"
-	"sort"
-	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -39,6 +38,8 @@ const (
 	NewTagPlaceholder = "NEW_TAG_HERE"
 )
 
+var gitUrlRegex = regexp.MustCompile("^git@([^:]+):([^/]+)/([^/]+).git$")
+
 func init() {
 	flag.StringVar(&argv.GitHubToken, "github-token", "", "OAuth2 token for GitHub API")
 	flag.StringVar(&argv.MainBranch, "main-branch", "main", "Name of the main branch (main, master, ...)")
@@ -53,10 +54,10 @@ type (
 		CommitHash     string
 		UserName       string
 		UserProfileUrl string
-		UserEmail      string
-		MergeNum       int
-		MergeUrl       string
-		Title          string
+		//UserEmail      string
+		MergeNum int
+		MergeUrl string
+		Title    string
 	}
 )
 
@@ -95,8 +96,20 @@ func githubAPI(p string, dst interface{}) error {
 
 func execGit(dst io.Writer, args ...string) error {
 	cmd := exec.Command("git", args...)
+	log.Println("#", cmd.String())
 	cmd.Stdout = dst
-	return cmd.Run()
+	var buf bytes.Buffer
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return fmt.Errorf("%s: %s", ee.String(), buf.String())
+		} else {
+			log.Println(buf.String())
+		}
+	}
+	return err
 }
 
 func execGitOneLine(args ...string) (string, error) {
@@ -113,9 +126,13 @@ func setupRepoAPIURL() error {
 		return err
 	}
 
+	if m := gitUrlRegex.FindAllStringSubmatch(origin, -1); len(m) > 0 {
+		origin = "git://" + strings.Join(m[0][1:4], "/")
+	}
+
 	parsed, err := url.Parse(origin)
 	if err != nil {
-		return err
+		return fmt.Errorf("url parse: %w", err)
 	}
 
 	if parsed.Host != "github.com" {
@@ -130,6 +147,7 @@ func setupRepoAPIURL() error {
 	}
 
 	apiUrl = "https://api.github.com/repos" + orgWithProject + "/"
+	log.Println("apiUrl:", apiUrl)
 
 	return nil
 }
@@ -165,112 +183,47 @@ func getLastGitTag() (string, error) {
 }
 
 func getGitMerges(lastTag string) ([]MergeInfo, error) {
-	branch := "origin/" + argv.MainBranch
-	var buf bytes.Buffer
-	if err := execGit(&buf, `log`, `--merges`, `--pretty=format:%H --- %an --- %aE --- %s`, lastTag+`..`+branch); err != nil {
-		return nil, err
+	var pullsInfo []struct {
+		Url    string `json:"html_url"`
+		Number int
+		State  string
+		Title  string
+		User   struct {
+			Login string
+			Url   string `json:"html_url"`
+		}
+		MergeCommitSHA string `json:"merge_commit_sha"`
+		MergedAt       string `json:"merged_at"`
+		// Body string
 	}
 
-	rdr := bufio.NewScanner(&buf)
-
-	mergeRegexp := regexp.MustCompile(`^Merge pull request #(\d+)`)
+	err := githubAPI("pulls?state=closed&sort=updated&direction=desc&per_page=100", &pullsInfo)
+	if err != nil {
+		return nil, fmt.Errorf("get pulls from githubAPI: %w", err)
+	}
 
 	var merges []MergeInfo
-
-	for rdr.Scan() {
-		line := strings.SplitN(rdr.Text(), " --- ", 4)
-		if len(line) != 4 {
-			log.Printf("Wrong merge line format %q. Will ignore it.", rdr.Text())
-			continue
-		}
-		mergeText := line[3]
-
-		idxs := mergeRegexp.FindStringSubmatchIndex(mergeText)
-		if len(idxs) != 4 {
-			log.Printf("Ignore merge %q", rdr.Text())
-			continue
-		}
-
-		mergeNumber, err := strconv.Atoi(mergeText[idxs[2]:idxs[3]])
-		if err != nil {
-			// WTF?
-			log.Printf("Wrong merge title format %q: %s. Will ignore it.", rdr.Text(), err)
+	for _, pi := range pullsInfo {
+		if pi.MergedAt == "" {
 			continue
 		}
 
 		merges = append(merges, MergeInfo{
-			CommitHash: line[0],
-			UserName:   line[1],
-			UserEmail:  line[2],
-			MergeNum:   mergeNumber,
+			CommitHash:     pi.MergeCommitSHA,
+			UserName:       pi.User.Login,
+			UserProfileUrl: pi.User.Url,
+			MergeNum:       pi.Number,
+			MergeUrl:       pi.Url,
+			Title:          title(pi.Title),
 		})
-	}
-	if rdr.Err() != nil {
-		return nil, fmt.Errorf("can't parse git merges list: %w", rdr.Err())
-	}
-
-	sort.Slice(merges, func(i, j int) bool {
-		return merges[i].MergeNum > merges[j].MergeNum
-	})
-
-	err := populateMergeWithInfo(merges)
-	if err != nil {
-		log.Printf("can't get GitHub names for some contributors: %s", err)
 	}
 
 	return merges, nil
 }
 
-func populateMergeWithInfo(merges []MergeInfo) error {
-	for i := range merges {
-		commitSha := merges[i].CommitHash
-
-		var pullsInfo []struct {
-			Url    string `json:"html_url"`
-			Number int
-			State  string
-			Title  string
-			User   struct {
-				Login string
-				Url   string `json:"html_url"`
-			}
-			// Body string
-		}
-
-		log.Printf("Get pull request by commit %s from %s...", commitSha, merges[i].UserName)
-
-		err := githubAPI("commits/"+commitSha+"/pulls", &pullsInfo)
-		if err != nil {
-			log.Printf("Can't get pull requests by commit %s: %s", commitSha, err)
-			continue
-		}
-
-		found := false
-		for j := range pullsInfo {
-			pull := &pullsInfo[j]
-			if pull.State != "closed" {
-				continue
-			}
-
-			merges[i].MergeNum = pull.Number
-			merges[i].MergeUrl = pull.Url
-			merges[i].Title = title(pull.Title)
-			merges[i].UserName = pull.User.Login
-			merges[i].UserProfileUrl = pull.User.Url
-
-			found = true
-			break
-		}
-
-		if !found {
-			log.Printf("There is no closed PR found for merge %+v...", merges[i])
-		}
-	}
-
-	return nil
-}
-
 func title(s string) string {
+	s = strings.TrimSpace(s)
+
 	if len(s) == 0 {
 		return ""
 	}
@@ -322,10 +275,11 @@ func generate() (string, error) {
 		return "", fmt.Errorf("can't get repo url: %w", err)
 	}
 
-	lastTag, err := getLastGitTag()
-	if err != nil {
-		return "", fmt.Errorf("can't get last repo tag: %w", err)
-	}
+	//lastTag, err := getLastGitTag()
+	//if err != nil {
+	//	return "", fmt.Errorf("can't get last repo tag: %w", err)
+	//}
+	lastTag := "unknown"
 
 	merges, err := getGitMerges(lastTag)
 	if err != nil {
